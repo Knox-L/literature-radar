@@ -14,6 +14,7 @@ SEARCH_DAYS = 7
 MAX_RESULTS = 100
 MAX_AI_PAPERS = 40
 TOP_N = 15
+MIN_RELEVANCE_SCORE = 3.0
 
 # Final score:
 # scientific relevance = 70%
@@ -1046,12 +1047,18 @@ def combine_scores(papers, ai_results):
 
         final_papers.append(paper)
 
-    final_papers.sort(
-        key=lambda x: x["final_score"],
-        reverse=True
-    )
+    final_papers = [
+    paper
+    for paper in final_papers
+    if paper["relevance_score"] >= MIN_RELEVANCE_SCORE
+]
 
-    return final_papers[:TOP_N]
+final_papers.sort(
+    key=lambda x: x["final_score"],
+    reverse=True
+)
+
+return final_papers[:TOP_N]
 
 
 # ============================================================
