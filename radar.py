@@ -1,235 +1,143 @@
 import os
 import json
 import re
-import requests
+import smtplib
 from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+import requests
 from openai import OpenAI
 
 
 # ============================================================
-# Basic settings
+# Configuration
 # ============================================================
 
 SEARCH_DAYS = 7
 MAX_RESULTS = 100
 MAX_AI_PAPERS = 40
 TOP_N = 15
+
+# Papers with AI relevance below this score will not be emailed
 MIN_RELEVANCE_SCORE = 3.0
 
-# Final score:
-# scientific relevance = 70%
-# recency = 15%
-# journal quality = 15%
+# Final score weights
 RELEVANCE_WEIGHT = 0.70
 RECENCY_WEIGHT = 0.15
 JOURNAL_WEIGHT = 0.15
 
+# File used to store successfully emailed PMIDs
+SEEN_FILE = "seen_pmids.json"
 
-# ============================================================
-# PubMed search terms
-# ============================================================
-
-PUBMED_QUERY = """
-(
-    "transitive inference"[Title/Abstract]
-    OR "transitive reasoning"[Title/Abstract]
-    OR "relational inference"[Title/Abstract]
-    OR "relational reasoning"[Title/Abstract]
-    OR "relational memory"[Title/Abstract]
-    OR "relational representation"[Title/Abstract]
-    OR "relational structure"[Title/Abstract]
-    OR "hierarchical representation"[Title/Abstract]
-    OR "hierarchical structure"[Title/Abstract]
-    OR "schema-based inference"[Title/Abstract]
-    OR "schema-based reasoning"[Title/Abstract]
-    OR "structural learning"[Title/Abstract]
-    OR "structure learning"[Title/Abstract]
-    OR
-    (
-        hippocamp*[Title/Abstract]
-        AND
-        (
-            prefrontal[Title/Abstract]
-            OR mPFC[Title/Abstract]
-            OR prelimbic[Title/Abstract]
-            OR "prelimbic cortex"[Title/Abstract]
-            OR "anterior cingulate"[Title/Abstract]
-            OR ACC[Title/Abstract]
-            OR Cg1[Title/Abstract]
-        )
-    )
-)
-"""
+# 163 SMTP settings
+SMTP_SERVER = "smtp.163.com"
+SMTP_PORT = 465
 
 
 # ============================================================
-# Scientific relevance keywords
+# Research interests
 # ============================================================
-
-# ------------------------------------------------------------
-# Level A: Core research questions
-# Highest priority
-# ------------------------------------------------------------
 
 CORE_TI_KEYWORDS = [
     "transitive inference",
     "transitive reasoning",
-    "transitive relational",
-    "relational inference",
-    "relational reasoning",
-    "inferential reasoning",
-    "transitive",
+    "transitive relationship",
+    "transitive relationships",
+    "transitive learning",
 ]
-
 
 CORE_RELATIONAL_KEYWORDS = [
+    "relational inference",
+    "relational reasoning",
     "relational memory",
     "relational representation",
-    "relational structure",
-    "relational map",
-    "relational knowledge",
+    "relational representations",
     "hierarchical representation",
+    "hierarchical representations",
     "hierarchical structure",
+    "hierarchical organization",
     "schema-based inference",
+    "schema based inference",
     "schema-based reasoning",
-    "schema learning",
-    "structural learning",
-    "structure learning",
-    "relational learning",
+    "schema based reasoning",
+    "structural knowledge",
+    "relational knowledge",
 ]
-
-
-# ------------------------------------------------------------
-# Level B: Circuit mechanisms
-# ------------------------------------------------------------
 
 CIRCUIT_KEYWORDS = [
-    "hippocampal-prefrontal",
-    "hippocampus-prefrontal",
-    "hippocampal prefrontal",
-    "hippocampus prefrontal",
-
-    "hippocampal-acc",
-    "hippocampus-acc",
-    "hippocampal acc",
-    "hippocampus acc",
-
-    "hippocampal-mpfc",
-    "hippocampus-mpfc",
-    "hippocampal mpfc",
-    "hippocampus mpfc",
-
-    "hippocampal-prelimbic",
-    "hippocampus-prelimbic",
-    "hippocampal prelimbic",
-    "hippocampus prelimbic",
-
-    "ventral ca1",
-    "vca1",
-    "ventral hippocampus",
-    "ventral hippocamp",
-
-    "prelimbic cortex",
-    "prelimbic",
-    "mPFC",
+    "hippocamp",
+    "prefrontal",
     "prefrontal cortex",
-
-    "anterior cingulate cortex",
+    "mPFC",
+    "medial prefrontal",
+    "prelimbic",
+    "prelimbic cortex",
+    "PL cortex",
     "anterior cingulate",
     "ACC",
-    "Cg1",
+    "cingulate cortex",
+    "vCA1",
+    "ventral CA1",
+    "CA1",
+    "hippocampal-prefrontal",
+    "hippocampal prefrontal",
+    "hippocampal-cortical",
+    "hippocampal cortical",
 ]
-
-
-# ------------------------------------------------------------
-# Level B/C: Neural mechanisms relevant to electrophysiology
-# ------------------------------------------------------------
 
 MECHANISM_KEYWORDS = [
     "electrophysiology",
-    "in vivo electrophysiology",
+    "electrophysiological",
+    "single-unit",
+    "single neuron",
+    "neuronal dynamics",
+    "neural dynamics",
     "local field potential",
     "LFP",
-    "neural dynamics",
-    "population dynamics",
-    "ensemble activity",
-    "population activity",
-
     "theta",
     "gamma",
-    "theta-gamma",
-    "phase-amplitude coupling",
-    "PAC",
-    "cross-frequency coupling",
-    "spike-field coupling",
-
-    "coherence",
-    "synchrony",
-    "synchronization",
-    "functional connectivity",
-    "directed connectivity",
-
-    "granger causality",
-    "directional connectivity",
-
     "sharp-wave ripple",
     "sharp wave ripple",
-    "sharp-wave ripples",
-    "sharp wave ripples",
-    "ripple oscillation",
-    "ripple oscillations",
-    "ripples",
-
+    "ripple",
+    "phase-amplitude coupling",
+    "PAC",
+    "coherence",
+    "connectivity",
+    "functional connectivity",
+    "effective connectivity",
+    "granger",
+    "causal",
     "optogenetic",
     "optogenetics",
-    "projection-specific",
-    "circuit manipulation",
+    "chemogenetic",
+    "neural decoding",
+    "population coding",
 ]
-
-
-# ------------------------------------------------------------
-# Level C: General cognitive/memory relevance
-# ------------------------------------------------------------
 
 GENERAL_MEMORY_KEYWORDS = [
     "memory",
     "learning",
-    "memory retrieval",
-    "memory recall",
+    "cognitive",
+    "cognition",
     "decision making",
     "decision-making",
-    "cognitive control",
-    "cognitive flexibility",
     "schema",
-    "retrieval",
-    "recall",
+    "spatial memory",
+    "episodic memory",
 ]
-
-
-# ------------------------------------------------------------
-# Peripheral topics
-# These should reduce relevance unless there is a strong
-# transferable mechanism.
-# ------------------------------------------------------------
 
 LOW_PRIORITY_KEYWORDS = [
     "depression",
-    "major depressive",
     "anxiety",
-    "stress",
-    "trauma",
-    "post-traumatic",
-    "fear conditioning",
-    "fear extinction",
-    "obesity",
-    "epilepsy",
-    "seizure",
+    "schizophrenia",
     "addiction",
-    "pain",
-    "aging",
-    "dementia",
-    "alzheimer",
-    "parkinson",
+    "multiple sclerosis",
+    "stroke",
+    "aphasia",
+    "clinical",
+    "patient",
+    "psychopathology",
 ]
 
 
@@ -237,327 +145,129 @@ LOW_PRIORITY_KEYWORDS = [
 # Journal tiers
 # ============================================================
 
-JOURNAL_TIERS = {
+JOURNAL_TIER_1 = {
+    "Nature",
+    "Science",
+    "Cell",
+    "Nature Neuroscience",
+    "Nature Human Behaviour",
+    "Nature Communications",
+    "Neuron",
+    "Current Biology",
+    "Proceedings of the National Academy of Sciences",
+    "PNAS",
+    "Science Advances",
+    "Psychological Science",
+}
 
-    # -------------------------
-    # Tier 1
-    # -------------------------
+JOURNAL_TIER_2 = {
+    "Journal of Neuroscience",
+    "Cerebral Cortex",
+    "Hippocampus",
+    "Learning & Memory",
+    "Neurobiology of Learning and Memory",
+    "Neuropsychologia",
+    "Cognitive Neuroscience",
+    "Journal of Cognitive Neuroscience",
+    "eLife",
+    "Behavioral Neuroscience",
+}
 
-    "nature": 1,
-    "science": 1,
-    "cell": 1,
+JOURNAL_TIER_3 = {
+    "Scientific Reports",
+    "PLOS ONE",
+    "Behavioral Sciences",
+}
 
-    "nature neuroscience": 1,
-    "nature human behaviour": 1,
-    "nature communications": 1,
-    "nature reviews neuroscience": 1,
-    "nature reviews. neuroscience": 1,
-
-    "neuron": 1,
-    "current biology": 1,
-    "pnas": 1,
-    "proceedings of the national academy of sciences": 1,
-    "science advances": 1,
-
-    "psychological science": 1,
-    "trends in cognitive sciences": 1,
-    "nature reviews psychology": 1,
-
-    "neuroscience and biobehavioral reviews": 1,
-    "annual review of psychology": 1,
-    "annual review of neuroscience": 1,
-
-
-    # -------------------------
-    # Tier 2
-    # -------------------------
-
-    "journal of neuroscience": 2,
-    "cerebral cortex": 2,
-    "hippocampus": 2,
-    "learning & memory": 2,
-    "learning and memory": 2,
-
-    "neurobiology of learning and memory": 2,
-    "behavioral neuroscience": 2,
-    "neuropsychologia": 2,
-
-    "journal of cognitive neuroscience": 2,
-    "cognitive neuroscience": 2,
-
-    "psychonomic bulletin & review": 2,
-    "psychonomic bulletin and review": 2,
-
-    "memory & cognition": 2,
-    "memory and cognition": 2,
-
-    "journal of experimental psychology": 2,
-    "journal of experimental psychology: learning memory and cognition": 2,
-
-    "hippocampal neuroscience": 2,
-
-
-    # -------------------------
-    # Tier 3
-    # -------------------------
-
-    "scientific reports": 3,
-    "plos one": 3,
-    "plos biology": 3,
-    "frontiers in neuroscience": 3,
-    "frontiers in psychology": 3,
-
-    "behavioral sciences": 3,
-    "bmc neuroscience": 3,
+JOURNAL_TIER_4 = {
+    "NeuroImage",
+    "Journal of Neurophysiology",
+    "eNeuro",
+    "Cortex",
 }
 
 
 # ============================================================
-# Journal score
+# PubMed
 # ============================================================
 
-def get_journal_tier(journal):
+PUBMED_EUTILS = (
+    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+)
+
+
+def build_pubmed_query():
     """
-    Return journal tier.
-    1 = highest
-    2 = strong specialized journal
-    3 = general / lower priority
-    4 = unknown
-    """
-
-    journal = journal.lower().strip()
-
-    # Exact / partial matching
-    for name, tier in JOURNAL_TIERS.items():
-        if name in journal:
-            return tier
-
-    return 4
-
-
-def journal_score(journal):
-    tier = get_journal_tier(journal)
-
-    if tier == 1:
-        return 10.0
-    elif tier == 2:
-        return 8.0
-    elif tier == 3:
-        return 5.0
-    else:
-        return 4.0
-
-
-# ============================================================
-# Recency score
-# ============================================================
-
-def recency_score(publication_year):
-    current_year = datetime.now().year
-
-    try:
-        year = int(publication_year)
-    except Exception:
-        return 4.0
-
-    age = current_year - year
-
-    if age <= 0:
-        return 10.0
-    elif age == 1:
-        return 9.5
-    elif age == 2:
-        return 9.0
-    elif age == 3:
-        return 8.5
-    elif age == 4:
-        return 8.0
-    elif age == 5:
-        return 7.5
-    elif age <= 7:
-        return 6.5
-    elif age <= 10:
-        return 5.5
-    elif age <= 15:
-        return 4.0
-    elif age <= 20:
-        return 2.5
-    else:
-        return 1.0
-
-
-# ============================================================
-# Scientific relevance score
-# ============================================================
-
-def count_keywords(text, keywords):
-    text = text.lower()
-
-    return sum(
-        1
-        for keyword in keywords
-        if keyword.lower() in text
-    )
-
-
-def local_keyword_score(text):
-    """
-    Hierarchical scientific relevance scoring.
-
-    Level A:
-        Direct TI / relational inference
-
-    Level B:
-        Relational representation / hierarchy
-        + hippocampal-prefrontal / ACC circuitry
-
-    Level C:
-        Electrophysiology / neural dynamics /
-        general memory
-
-    Peripheral clinical topics are penalized.
+    Research-focused PubMed query.
     """
 
-    text = text.lower()
-
-    # -----------------------------------------
-    # Count keyword groups
-    # -----------------------------------------
-
-    ti_score = count_keywords(
-        text,
-        CORE_TI_KEYWORDS
-    )
-
-    relational_score = count_keywords(
-        text,
-        CORE_RELATIONAL_KEYWORDS
-    )
-
-    circuit_score = count_keywords(
-        text,
-        CIRCUIT_KEYWORDS
-    )
-
-    mechanism_score = count_keywords(
-        text,
-        MECHANISM_KEYWORDS
-    )
-
-    memory_score = count_keywords(
-        text,
-        GENERAL_MEMORY_KEYWORDS
-    )
-
-    low_priority_score = count_keywords(
-        text,
-        LOW_PRIORITY_KEYWORDS
-    )
-
-
-    # -----------------------------------------
-    # Base hierarchical score
-    # -----------------------------------------
-
-    score = 0.0
-
-    # Level A:
-    # Direct TI / relational inference
-    score += min(ti_score, 3) * 10.0
-
-    # Relational / hierarchical representation
-    score += min(relational_score, 4) * 6.0
-
-    # Relevant circuitry
-    score += min(circuit_score, 5) * 3.0
-
-    # Neural mechanisms
-    score += min(mechanism_score, 5) * 2.0
-
-    # General memory/cognition
-    score += min(memory_score, 3) * 1.0
-
-
-    # -----------------------------------------
-    # Penalize peripheral topics
-    # -----------------------------------------
-
-    score -= min(low_priority_score, 3) * 4.0
-
-
-    # -----------------------------------------
-    # Combination bonuses
-    # -----------------------------------------
-
-    has_ti = ti_score > 0
-    has_relational = relational_score > 0
-    has_circuit = circuit_score > 0
-    has_mechanism = mechanism_score > 0
-
-
-    # Direct TI + relevant circuit
-    if has_ti and has_circuit:
-        score += 15.0
-
-
-    # Relational representation + relevant circuit
-    if has_relational and has_circuit:
-        score += 10.0
-
-
-    # TI / relational cognition + neural mechanism
-    if (has_ti or has_relational) and has_mechanism:
-        score += 8.0
-
-
-    # General hippocampus/PFC papers
-    # receive no additional bonus.
-    #
-    # This is intentional:
-    # hippocampus + PFC alone should not outrank
-    # direct relational/TI studies.
-
-
-    return max(score, 0.0)
-
-
-# ============================================================
-# PubMed search
-# ============================================================
-
-def search_pubmed():
-    """
-    Search PubMed for papers published in the last SEARCH_DAYS.
-    """
-
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=SEARCH_DAYS)
-
-    start_str = start_date.strftime("%Y/%m/%d")
-    end_str = end_date.strftime("%Y/%m/%d")
-
-    query = f"""
+    return """
     (
-        {PUBMED_QUERY}
+        "transitive inference"[Title/Abstract]
+        OR "transitive reasoning"[Title/Abstract]
+        OR "transitive relationship"[Title/Abstract]
+        OR "transitive relationships"[Title/Abstract]
+        OR "relational inference"[Title/Abstract]
+        OR "relational reasoning"[Title/Abstract]
+        OR "relational memory"[Title/Abstract]
+        OR "relational representation"[Title/Abstract]
+        OR "relational representations"[Title/Abstract]
+        OR "hierarchical representation"[Title/Abstract]
+        OR "hierarchical representations"[Title/Abstract]
+        OR "hierarchical structure"[Title/Abstract]
+        OR "schema-based inference"[Title/Abstract]
+        OR "schema-based reasoning"[Title/Abstract]
+        OR "structural knowledge"[Title/Abstract]
+        OR "structural learning"[Title/Abstract]
+
+        OR
+        (
+            hippocamp*[Title/Abstract]
+            AND
+            (
+                prefrontal[Title/Abstract]
+                OR "prefrontal cortex"[Title/Abstract]
+                OR mPFC[Title/Abstract]
+                OR prelimbic[Title/Abstract]
+                OR "anterior cingulate"[Title/Abstract]
+                OR ACC[Title/Abstract]
+                OR "ventral CA1"[Title/Abstract]
+                OR vCA1[Title/Abstract]
+            )
+        )
     )
-    AND
-    ("{start_str}"[Date - Publication] : "{end_str}"[Date - Publication])
     """
 
-    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+
+def pubmed_search(query, days=7, max_results=100):
+    """
+    Search PubMed within the recent publication window.
+    """
+
+    end_date = datetime.utcnow().date()
+    start_date = end_date - timedelta(days=days)
+
+    date_filter = (
+        f'("{start_date.strftime("%Y/%m/%d")}"'
+        f'[Date - Publication] : '
+        f'"{end_date.strftime("%Y/%m/%d")}"'
+        f'[Date - Publication])'
+    )
+
+    full_query = f"({query}) AND {date_filter}"
 
     params = {
         "db": "pubmed",
-        "term": query,
+        "term": full_query,
         "retmode": "json",
-        "retmax": MAX_RESULTS,
-        "sort": "pub date",
+        "retmax": max_results,
+        "sort": "date",
     }
 
     response = requests.get(
-        url,
+        f"{PUBMED_EUTILS}/esearch.fcgi",
         params=params,
-        timeout=30
+        timeout=30,
     )
 
     response.raise_for_status()
@@ -567,74 +277,31 @@ def search_pubmed():
     return data["esearchresult"]["idlist"]
 
 
-# ============================================================
-# Fetch PubMed records
-# ============================================================
+def clean_xml_text(text):
+    """
+    Basic cleanup of PubMed XML text.
+    """
 
-def fetch_pubmed_records(pmids):
-    if not pmids:
-        return []
+    text = re.sub(r"<[^>]+>", "", text)
 
-    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-
-    params = {
-        "db": "pubmed",
-        "id": ",".join(pmids),
-        "retmode": "json",
-    }
-
-    response = requests.get(
-        url,
-        params=params,
-        timeout=30
+    text = (
+        text.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
     )
 
-    response.raise_for_status()
-
-    data = response.json()
-
-    results = []
-
-    for pmid in pmids:
-
-        item = data["result"].get(pmid)
-
-        if not item:
-            continue
-
-        title = item.get("title", "").strip()
-        journal = item.get("fulljournalname", "").strip()
-
-        pubdate = item.get("pubdate", "")
-
-        # Extract publication year
-        match = re.search(r"(19|20)\d{2}", pubdate)
-
-        if match:
-            publication_year = int(match.group(0))
-        else:
-            publication_year = datetime.now().year
-
-        results.append({
-            "pmid": pmid,
-            "title": title,
-            "journal": journal,
-            "publication_year": publication_year,
-            "pubdate": pubdate,
-        })
-
-    return results
+    return text.strip()
 
 
-# ============================================================
-# Fetch abstracts
-# ============================================================
+def fetch_pubmed_details(pmids):
+    """
+    Fetch title, abstract, journal, year and PMID.
+    """
 
-def fetch_abstracts(pmids):
     if not pmids:
-        return {}
-
-    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+        return []
 
     params = {
         "db": "pubmed",
@@ -643,130 +310,391 @@ def fetch_abstracts(pmids):
     }
 
     response = requests.get(
-        url,
+        f"{PUBMED_EUTILS}/efetch.fcgi",
         params=params,
-        timeout=30
+        timeout=60,
     )
 
     response.raise_for_status()
 
     xml = response.text
 
-    abstracts = {}
+    papers = []
 
-    # Split into article blocks
     articles = re.findall(
         r"<PubmedArticle>(.*?)</PubmedArticle>",
         xml,
-        flags=re.DOTALL
+        flags=re.DOTALL,
     )
 
     for article in articles:
 
         pmid_match = re.search(
             r"<PMID[^>]*>(.*?)</PMID>",
-            article
+            article,
+            flags=re.DOTALL,
         )
 
-        if not pmid_match:
-            continue
+        title_match = re.search(
+            r"<ArticleTitle>(.*?)</ArticleTitle>",
+            article,
+            flags=re.DOTALL,
+        )
 
-        pmid = pmid_match.group(1)
+        journal_match = re.search(
+            r"<Journal>.*?<Title>(.*?)</Title>",
+            article,
+            flags=re.DOTALL,
+        )
 
-        abstract_parts = re.findall(
+        abstract_matches = re.findall(
             r"<AbstractText[^>]*>(.*?)</AbstractText>",
             article,
-            flags=re.DOTALL
+            flags=re.DOTALL,
         )
 
-        abstract = " ".join(
-            re.sub(r"<[^>]+>", " ", part)
-            for part in abstract_parts
+        year_match = re.search(
+            r"<PubDate>.*?<Year>(.*?)</Year>",
+            article,
+            flags=re.DOTALL,
         )
 
-        abstract = re.sub(
-            r"\s+",
-            " ",
-            abstract
-        ).strip()
+        if not year_match:
+            year_match = re.search(
+                r"<PubDate>.*?<MedlineDate>(.*?)</MedlineDate>",
+                article,
+                flags=re.DOTALL,
+            )
 
-        abstracts[pmid] = abstract
+        pmid = (
+            clean_xml_text(pmid_match.group(1))
+            if pmid_match
+            else ""
+        )
 
-    return abstracts
+        title = (
+            clean_xml_text(title_match.group(1))
+            if title_match
+            else "Unknown title"
+        )
+
+        journal = (
+            clean_xml_text(journal_match.group(1))
+            if journal_match
+            else "Unknown journal"
+        )
+
+        abstract_parts = [
+            clean_xml_text(x)
+            for x in abstract_matches
+        ]
+
+        abstract = " ".join(abstract_parts)
+
+        year_text = (
+            clean_xml_text(year_match.group(1))
+            if year_match
+            else str(datetime.utcnow().year)
+        )
+
+        year_match_num = re.search(
+            r"(20\d{2}|19\d{2})",
+            year_text,
+        )
+
+        year = (
+            int(year_match_num.group(1))
+            if year_match_num
+            else datetime.utcnow().year
+        )
+
+        papers.append(
+            {
+                "pmid": pmid,
+                "title": title,
+                "journal": journal,
+                "abstract": abstract,
+                "year": year,
+            }
+        )
+
+    return papers
 
 
 # ============================================================
-# Prepare papers
+# De-duplication
 # ============================================================
 
-def prepare_papers(records, abstracts):
+def load_seen_pmids():
+    """
+    Load PMIDs that have already been successfully emailed.
+    """
 
-    papers = []
+    if not os.path.exists(SEEN_FILE):
+        return set()
 
-    for record in records:
+    try:
+        with open(
+            SEEN_FILE,
+            "r",
+            encoding="utf-8",
+        ) as f:
 
-        pmid = record["pmid"]
+            data = json.load(f)
 
-        abstract = abstracts.get(
-            pmid,
-            ""
+        if isinstance(data, list):
+            return {
+                str(x)
+                for x in data
+            }
+
+        return set()
+
+    except Exception as e:
+
+        print(
+            "Warning: Could not read "
+            f"{SEEN_FILE}: {e}"
         )
 
-        searchable_text = (
-            record["title"]
-            + " "
-            + abstract
-            + " "
-            + record["journal"]
+        return set()
+
+
+def save_seen_pmids(pmids):
+    """
+    Save successfully emailed PMIDs.
+    """
+
+    with open(
+        SEEN_FILE,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            sorted(list(pmids)),
+            f,
+            ensure_ascii=False,
+            indent=2,
         )
 
-        local_score = local_keyword_score(
-            searchable_text
-        )
 
-        recency = recency_score(
-            record["publication_year"]
-        )
+def remove_seen_papers(
+    papers,
+    seen_pmids,
+):
+    """
+    Remove papers that have already been emailed.
+    """
 
-        journal = journal_score(
-            record["journal"]
-        )
+    new_papers = [
+        paper
+        for paper in papers
+        if paper["pmid"] not in seen_pmids
+    ]
 
-        preliminary_score = (
-            local_score * RELEVANCE_WEIGHT
-            + recency * RECENCY_WEIGHT
-            + journal * JOURNAL_WEIGHT
-        )
-
-        papers.append({
-            "pmid": pmid,
-            "title": record["title"],
-            "journal": record["journal"],
-            "publication_year": record["publication_year"],
-            "abstract": abstract,
-            "local_score": local_score,
-            "recency_score": recency,
-            "journal_score": journal,
-            "journal_tier": get_journal_tier(
-                record["journal"]
-            ),
-            "preliminary_score": preliminary_score,
-        })
-
-    # Sort by local preliminary score
-    papers.sort(
-        key=lambda x: x["preliminary_score"],
-        reverse=True
+    already_sent = (
+        len(papers) - len(new_papers)
     )
 
-    return papers[:MAX_AI_PAPERS]
+    print(
+        f"Found {len(papers)} papers; "
+        f"{already_sent} already sent; "
+        f"{len(new_papers)} new papers remain."
+    )
+
+    return new_papers
 
 
 # ============================================================
-# DeepSeek / OpenAI-compatible client
+# Local relevance scoring
 # ============================================================
 
-def get_ai_client():
+def count_keyword_hits(
+    text,
+    keywords,
+):
+    text_lower = text.lower()
+
+    return sum(
+        1
+        for keyword in keywords
+        if keyword.lower() in text_lower
+    )
+
+
+def local_scientific_score(paper):
+    """
+    Hierarchical local relevance score.
+
+    Priority:
+    1. Transitive inference
+    2. Relational inference / hierarchical representation
+    3. Hippocampal-prefrontal / ACC circuit
+    4. Neural mechanisms
+    5. General memory/cognition
+    """
+
+    text = (
+        paper["title"]
+        + " "
+        + paper["abstract"]
+    )
+
+    ti_hits = count_keyword_hits(
+        text,
+        CORE_TI_KEYWORDS,
+    )
+
+    relational_hits = count_keyword_hits(
+        text,
+        CORE_RELATIONAL_KEYWORDS,
+    )
+
+    circuit_hits = count_keyword_hits(
+        text,
+        CIRCUIT_KEYWORDS,
+    )
+
+    mechanism_hits = count_keyword_hits(
+        text,
+        MECHANISM_KEYWORDS,
+    )
+
+    memory_hits = count_keyword_hits(
+        text,
+        GENERAL_MEMORY_KEYWORDS,
+    )
+
+    low_priority_hits = count_keyword_hits(
+        text,
+        LOW_PRIORITY_KEYWORDS,
+    )
+
+    score = 0
+
+    score += min(ti_hits, 3) * 10
+    score += min(relational_hits, 4) * 6
+    score += min(circuit_hits, 5) * 3
+    score += min(mechanism_hits, 5) * 2
+    score += min(memory_hits, 3) * 1
+
+    score -= min(low_priority_hits, 3) * 4
+
+    # Strong combinations
+    if ti_hits > 0 and circuit_hits > 0:
+        score += 15
+
+    if relational_hits > 0 and circuit_hits > 0:
+        score += 10
+
+    if (
+        (ti_hits > 0 or relational_hits > 0)
+        and mechanism_hits > 0
+    ):
+        score += 8
+
+    return max(score, 0)
+
+
+# ============================================================
+# Recency
+# ============================================================
+
+def recency_score(year):
+
+    current_year = datetime.utcnow().year
+
+    age = current_year - year
+
+    if age <= 0:
+        return 10.0
+
+    elif age == 1:
+        return 9.5
+
+    elif age == 2:
+        return 9.0
+
+    elif age == 3:
+        return 8.5
+
+    elif age == 4:
+        return 8.0
+
+    elif age == 5:
+        return 7.5
+
+    elif age <= 7:
+        return 6.5
+
+    elif age <= 10:
+        return 5.5
+
+    elif age <= 15:
+        return 4.0
+
+    elif age <= 20:
+        return 2.5
+
+    else:
+        return 1.0
+
+
+# ============================================================
+# Journal
+# ============================================================
+
+def normalize_journal_name(journal):
+    return journal.strip().lower()
+
+
+def journal_score(journal):
+
+    journal_lower = normalize_journal_name(
+        journal
+    )
+
+    tier_1 = {
+        normalize_journal_name(x)
+        for x in JOURNAL_TIER_1
+    }
+
+    tier_2 = {
+        normalize_journal_name(x)
+        for x in JOURNAL_TIER_2
+    }
+
+    tier_3 = {
+        normalize_journal_name(x)
+        for x in JOURNAL_TIER_3
+    }
+
+    tier_4 = {
+        normalize_journal_name(x)
+        for x in JOURNAL_TIER_4
+    }
+
+    if journal_lower in tier_1:
+        return 10.0, "Tier 1"
+
+    if journal_lower in tier_2:
+        return 8.0, "Tier 2"
+
+    if journal_lower in tier_3:
+        return 5.0, "Tier 3"
+
+    if journal_lower in tier_4:
+        return 4.0, "Tier 4"
+
+    return 4.0, "Unknown"
+
+
+# ============================================================
+# DeepSeek
+# ============================================================
+
+def create_client():
 
     api_key = os.environ.get(
         "OPENAI_API_KEY"
@@ -788,17 +716,13 @@ def get_ai_client():
 
     return OpenAI(
         api_key=api_key,
-        base_url=api_base
+        base_url=api_base,
     )
 
 
-# ============================================================
-# AI relevance evaluation
-# ============================================================
+def ai_score_papers(papers):
 
-def evaluate_with_ai(papers):
-
-    client = get_ai_client()
+    client = create_client()
 
     paper_text = []
 
@@ -808,17 +732,17 @@ def evaluate_with_ai(papers):
             f"""
 INDEX: {i}
 
-Title:
-{paper['title']}
+TITLE:
+{paper["title"]}
 
-Journal:
-{paper['journal']}
+JOURNAL:
+{paper["journal"]}
 
-Publication year:
-{paper['publication_year']}
+YEAR:
+{paper["year"]}
 
-Abstract:
-{paper['abstract']}
+ABSTRACT:
+{paper["abstract"]}
 """
         )
 
@@ -826,306 +750,372 @@ Abstract:
         paper_text
     )
 
-
     system_prompt = """
-You are a neuroscience literature screening assistant.
+You are a scientific literature relevance evaluator.
 
-Evaluate each paper for relevance to the user's research program.
-
-The user's primary research interests are:
+The researcher's main interests are:
 
 1. Transitive inference
 2. Relational inference and relational reasoning
-3. Relational memory and relational representation
-4. Hierarchical and schema-based representation
-5. Hippocampal-prefrontal / hippocampal-ACC circuitry
-6. Ventral CA1 and prelimbic cortex
-7. Electrophysiological neural dynamics
-8. Oscillatory coordination, theta-gamma coupling,
-   ripples, population dynamics, and directed connectivity
-9. Computational mechanisms underlying inference,
-   especially value-based versus relational accounts
+3. Relational memory and hierarchical representation
+4. Hippocampal-prefrontal/ACC mechanisms
+5. Hippocampus, especially CA1/vCA1
+6. Prelimbic/mPFC and ACC/Cg1
+7. Electrophysiology, LFP, neural dynamics and inter-regional coordination
+8. Optogenetic/causal circuit manipulation
+9. Computational models of value-based versus relational inference
 
-Use this relevance hierarchy.
+Use the following relevance hierarchy.
 
-VERY HIGH RELEVANCE:
-- Direct transitive inference studies
-- Direct relational inference/reasoning studies
-- Studies directly testing hippocampal-prefrontal mechanisms
-  of transitive or relational inference
-- Rodent studies directly relevant to transitive inference
-- Studies providing a directly useful experimental paradigm
-  for rodent relational inference
+10 = directly studies transitive inference or a closely related inference paradigm and is highly relevant.
 
-HIGH RELEVANCE:
-- Relational memory
-- Relational representation
-- Hierarchical representation
-- Relational maps
-- Schema-based inference
-- Structural learning
-- Hippocampal-prefrontal or hippocampal-ACC mechanisms
-  closely related to memory, inference, learning, or decision making
-- Neural dynamics that directly inform relational computation
+9 = directly studies relational inference/reasoning, hierarchical representations, or schema-based inference and is strongly relevant.
 
-MODERATE RELEVANCE:
-- General hippocampal-prefrontal electrophysiology
-- Hippocampal-prefrontal oscillatory coordination
-- Neural population dynamics
-- Theta/gamma/PAC/coherence/ripple mechanisms
-- General memory or cognitive-control mechanisms
+8 = directly studies hippocampal-prefrontal/ACC mechanisms of relational memory, inference, learning, or hierarchical representations.
 
-LOW RELEVANCE:
-- Studies involving hippocampus or PFC only incidentally
-- General motivation or reward studies without relational relevance
-- Clinical or disease studies without a transferable mechanism
+7 = studies neural mechanisms highly relevant to the researcher's circuit/electrophysiological interests, even if not directly about transitive inference.
 
-VERY LOW RELEVANCE:
-- Depression
-- Anxiety
-- Stress
-- Trauma
-- Fear conditioning/extinction
-- Obesity
-- Epilepsy
-- Pain
-- Aging
-- Dementia
-- Other clinical topics
+5-6 = moderately relevant cognitive or memory research with some useful conceptual or neural overlap.
 
-IMPORTANT:
+3-4 = general hippocampal, prefrontal, memory, learning, or decision-making research with limited direct relevance.
 
-Scientific relevance is much more important than journal prestige.
+1-2 = peripheral relevance.
 
-Do NOT give a high score merely because a paper is published
-in Nature, Science, Neuron, PNAS, or another prestigious journal.
+0 = essentially irrelevant.
 
-A highly relevant paper in a specialized journal should rank
-above a prestigious but weakly relevant paper.
+Important rules:
 
-A paper involving hippocampus + PFC alone is NOT automatically
-highly relevant.
+- Scientific relevance is more important than journal prestige.
+- A Nature/Science paper should NOT receive a high relevance score merely because of journal prestige.
+- Direct transitive inference and relational inference papers should rank above generic hippocampus/PFC papers.
+- Papers about clinical disorders should generally receive low scores unless they directly address relational inference or the relevant circuit mechanism.
+- Artificial intelligence papers about relational reasoning should generally receive low scores unless they provide a directly useful computational theory for biological transitive inference.
+- Prefer rat/mouse neuroscience studies when otherwise comparable.
+- Prefer hippocampus-PL/ACC/vCA1 circuit studies when otherwise comparable.
+- Prefer electrophysiology, neural dynamics, and causal manipulation when otherwise comparable.
 
-Direct transitive inference or relational inference should
-normally outrank general hippocampal-prefrontal studies.
+Return ONLY valid JSON.
 
-Relational representation combined with hippocampal-prefrontal
-circuit mechanisms should receive a high score.
-
-General clinical papers should usually receive low scores even
-if they mention hippocampus, PFC, or ACC.
-
-Do not automatically reject older papers.
-Older classic papers can still be important if scientifically
-relevant.
-
-Return a relevance score from 0 to 10.
-
-Also assign one category, such as:
-- Transitive inference
-- Relational inference
-- Relational memory
-- Hierarchical representation
-- Hippocampal-prefrontal circuit
-- Hippocampal-ACC circuit
-- Neural dynamics
-- Electrophysiology
-- Computational neuroscience
-- General memory
-- Peripheral/clinical
-
-For "why_relevant", explain specifically why the paper matters
-for the user's research rather than simply repeating keywords.
-
-For "tldr", summarize the main scientific finding in 1-2 sentences.
-
-Return ONLY valid JSON in this format:
+Format:
 
 [
   {
     "index": 0,
     "relevance_score": 9.5,
     "category": "Transitive inference",
-    "why_relevant": "...",
-    "tldr": "..."
+    "why_relevant": "One concise sentence.",
+    "tldr": "One concise sentence."
   }
 ]
+
+Do not include markdown.
 """
-
-
-    user_prompt = f"""
-Evaluate the following papers.
-
-{combined_text}
-"""
-
 
     response = client.chat.completions.create(
         model="deepseek-flash",
         messages=[
             {
                 "role": "system",
-                "content": system_prompt
+                "content": system_prompt,
             },
             {
                 "role": "user",
-                "content": user_prompt
-            }
+                "content": combined_text,
+            },
         ],
-        temperature=0.1,
+        temperature=0,
     )
 
+    content = (
+        response.choices[0]
+        .message.content
+        .strip()
+    )
 
-    content = response.choices[0].message.content.strip()
-
-    # Remove accidental Markdown code fences
+    # Remove accidental Markdown fences
     content = re.sub(
         r"^```json\s*",
         "",
-        content
+        content,
+        flags=re.IGNORECASE,
     )
 
     content = re.sub(
         r"\s*```$",
         "",
-        content
+        content,
     )
 
     return json.loads(content)
 
 
 # ============================================================
-# Combine AI score + recency + journal
+# Combine scores
 # ============================================================
 
-def combine_scores(papers, ai_results):
+def combine_scores(
+    papers,
+    ai_results,
+):
 
-    ai_map = {
+    ai_by_index = {
         item["index"]: item
         for item in ai_results
     }
 
-    final_papers = []
+    scored = []
 
-    for index, paper in enumerate(papers):
+    for i, paper in enumerate(papers):
 
-        ai = ai_map.get(index)
-
-        if not ai:
+        if i not in ai_by_index:
             continue
 
+        ai = ai_by_index[i]
+
         relevance = float(
-            ai.get("relevance_score", 0)
+            ai.get(
+                "relevance_score",
+                0,
+            )
         )
 
-        recency = paper["recency_score"]
-        journal = paper["journal_score"]
+        recency = recency_score(
+            paper["year"]
+        )
+
+        journal, tier = journal_score(
+            paper["journal"]
+        )
 
         final_score = (
-            relevance * RELEVANCE_WEIGHT
-            + recency * RECENCY_WEIGHT
-            + journal * JOURNAL_WEIGHT
+            RELEVANCE_WEIGHT * relevance
+            + RECENCY_WEIGHT * recency
+            + JOURNAL_WEIGHT * journal
         )
 
-        paper["relevance_score"] = relevance
-        paper["final_score"] = final_score
+        paper_copy = paper.copy()
 
-        paper["category"] = ai.get(
-            "category",
-            "Uncategorized"
+        paper_copy.update(
+            {
+                "relevance_score": relevance,
+                "recency_score": recency,
+                "journal_score": journal,
+                "journal_tier": tier,
+                "final_score": final_score,
+                "category": ai.get(
+                    "category",
+                    "Other",
+                ),
+                "why_relevant": ai.get(
+                    "why_relevant",
+                    "",
+                ),
+                "tldr": ai.get(
+                    "tldr",
+                    "",
+                ),
+            }
         )
 
-        paper["why_relevant"] = ai.get(
-            "why_relevant",
-            ""
+        scored.append(
+            paper_copy
         )
 
-        paper["tldr"] = ai.get(
-            "tldr",
-            ""
-        )
+    # Do not fill TOP_N with irrelevant papers
+    scored = [
+        paper
+        for paper in scored
+        if paper["relevance_score"]
+        >= MIN_RELEVANCE_SCORE
+    ]
 
-        final_papers.append(paper)
+    scored.sort(
+        key=lambda x: x["final_score"],
+        reverse=True,
+    )
 
-    final_papers = [
-    paper
-    for paper in final_papers
-    if paper["relevance_score"] >= MIN_RELEVANCE_SCORE
-]
-
-final_papers.sort(
-    key=lambda x: x["final_score"],
-    reverse=True
-)
-
-return final_papers[:TOP_N]
+    return scored[:TOP_N]
 
 
 # ============================================================
-# Print results
+# Email
 # ============================================================
 
-def print_results(papers):
+def create_email_html(papers):
 
-    print("\n")
-    print("=" * 70)
-    print("TOP 15 PAPERS")
-    print("=" * 70)
+    today = datetime.now().strftime(
+        "%Y-%m-%d"
+    )
 
-    for i, paper in enumerate(
+    html = f"""
+<html>
+<head>
+<meta charset="UTF-8">
+</head>
+
+<body>
+
+<h2>Weekly Literature Radar</h2>
+
+<p>
+<strong>Date:</strong> {today}<br>
+<strong>New relevant papers:</strong> {len(papers)}
+</p>
+
+<hr>
+"""
+
+    for rank, paper in enumerate(
         papers,
-        start=1
+        1,
     ):
 
-        print(
-            f"\n[{i}] "
-            f"{paper['final_score']:.1f}/10 "
-            f"{paper['title']}"
-        )
-
-        print(
-            f"Relevance: "
-            f"{paper['relevance_score']:.1f}/10"
-        )
-
-        print(
-            f"Recency: "
-            f"{paper['recency_score']:.1f}/10"
-        )
-
-        tier = paper["journal_tier"]
-
-        print(
-            f"Journal: "
-            f"{paper['journal']} "
-            f"(Tier {tier})"
-        )
-
-        print(
-            f"Publication year: "
-            f"{paper['publication_year']}"
-        )
-
-        print(
-            f"Category: "
-            f"{paper['category']}"
-        )
-
-        print(
-            f"Why relevant: "
-            f"{paper['why_relevant']}"
-        )
-
-        print(
-            f"TL;DR: "
-            f"{paper['tldr']}"
-        )
-
-        print(
-            f"URL: "
-            f"https://pubmed.ncbi.nlm.nih.gov/"
+        pubmed_url = (
+            "https://pubmed.ncbi.nlm.nih.gov/"
             f"{paper['pmid']}/"
         )
+
+        html += f"""
+<h3>
+{rank}. {paper['title']}
+</h3>
+
+<p>
+<strong>Final score:</strong>
+{paper['final_score']:.1f}/10
+<br>
+
+<strong>Relevance:</strong>
+{paper['relevance_score']:.1f}/10
+<br>
+
+<strong>Journal:</strong>
+{paper['journal']}
+({paper['journal_tier']})
+<br>
+
+<strong>Year:</strong>
+{paper['year']}
+<br>
+
+<strong>Category:</strong>
+{paper['category']}
+</p>
+
+<p>
+<strong>Why relevant:</strong>
+{paper['why_relevant']}
+</p>
+
+<p>
+<strong>TL;DR:</strong>
+{paper['tldr']}
+</p>
+
+<p>
+<a href="{pubmed_url}">
+View on PubMed
+</a>
+</p>
+
+<hr>
+"""
+
+    html += """
+<p>
+This literature radar was automatically generated.
+</p>
+
+</body>
+</html>
+"""
+
+    return html
+
+
+def send_email(papers):
+
+    sender = os.environ.get(
+        "SENDER"
+    )
+
+    receiver = os.environ.get(
+        "RECEIVER"
+    )
+
+    password = os.environ.get(
+        "SENDER_PASSWORD"
+    )
+
+    if not sender:
+        raise RuntimeError(
+            "SENDER is not set."
+        )
+
+    if not receiver:
+        raise RuntimeError(
+            "RECEIVER is not set."
+        )
+
+    if not password:
+        raise RuntimeError(
+            "SENDER_PASSWORD is not set."
+        )
+
+    today = datetime.now().strftime(
+        "%Y-%m-%d"
+    )
+
+    subject = (
+        f"Weekly Literature Radar — "
+        f"{today} — {len(papers)} papers"
+    )
+
+    message = MIMEMultipart(
+        "alternative"
+    )
+
+    message["From"] = sender
+    message["To"] = receiver
+    message["Subject"] = subject
+
+    html = create_email_html(
+        papers
+    )
+
+    message.attach(
+        MIMEText(
+            html,
+            "html",
+            "utf-8",
+        )
+    )
+
+    print(
+        f"Sending email from {sender} "
+        f"to {receiver}..."
+    )
+
+    with smtplib.SMTP_SSL(
+        SMTP_SERVER,
+        SMTP_PORT,
+        timeout=30,
+    ) as server:
+
+        server.login(
+            sender,
+            password,
+        )
+
+        server.sendmail(
+            sender,
+            receiver,
+            message.as_string(),
+        )
+
+    print(
+        "Email sent successfully."
+    )
 
 
 # ============================================================
@@ -1135,68 +1125,257 @@ def print_results(papers):
 def main():
 
     print(
-        "Searching PubMed..."
+        "Starting weekly literature radar..."
     )
 
-    pmids = search_pubmed()
+    # --------------------------------------------------------
+    # 1. Load history
+    # --------------------------------------------------------
+
+    seen_pmids = load_seen_pmids()
 
     print(
-        f"Found {len(pmids)} PubMed records."
+        f"Previously sent papers: "
+        f"{len(seen_pmids)}"
     )
 
-    if not pmids:
+    # --------------------------------------------------------
+    # 2. Search PubMed
+    # --------------------------------------------------------
+
+    query = build_pubmed_query()
+
+    pmids = pubmed_search(
+        query,
+        days=SEARCH_DAYS,
+        max_results=MAX_RESULTS,
+    )
+
+    print(
+        f"PubMed returned "
+        f"{len(pmids)} papers."
+    )
+
+    # --------------------------------------------------------
+    # 3. Fetch details
+    # --------------------------------------------------------
+
+    papers = fetch_pubmed_details(
+        pmids
+    )
+
+    print(
+        f"Successfully fetched "
+        f"{len(papers)} papers."
+    )
+
+    # --------------------------------------------------------
+    # 4. Remove already sent papers
+    # --------------------------------------------------------
+
+    papers = remove_seen_papers(
+        papers,
+        seen_pmids,
+    )
+
+    if not papers:
+
         print(
-            "No papers found."
+            "No new papers found."
         )
+
         return
 
+    # --------------------------------------------------------
+    # 5. Local pre-filter
+    # --------------------------------------------------------
+
+    for paper in papers:
+
+        paper["local_score"] = (
+            local_scientific_score(
+                paper
+            )
+        )
+
+        paper["local_recency"] = (
+            recency_score(
+                paper["year"]
+            )
+        )
+
+        (
+            paper["local_journal"],
+            _
+        ) = journal_score(
+            paper["journal"]
+        )
+
+        paper["preliminary_score"] = (
+            0.70
+            * paper["local_score"]
+            + 0.15
+            * paper["local_recency"]
+            + 0.15
+            * paper["local_journal"]
+        )
+
+    papers.sort(
+        key=lambda x: x["preliminary_score"],
+        reverse=True,
+    )
+
+    papers_for_ai = papers[
+        :MAX_AI_PAPERS
+    ]
 
     print(
-        "Fetching PubMed records..."
+        f"Sending top "
+        f"{len(papers_for_ai)} "
+        f"candidates to DeepSeek..."
     )
 
-    records = fetch_pubmed_records(
-        pmids
-    )
+    # --------------------------------------------------------
+    # 6. AI scoring
+    # --------------------------------------------------------
 
-
-    print(
-        "Fetching abstracts..."
-    )
-
-    abstracts = fetch_abstracts(
-        pmids
-    )
-
-
-    print(
-        "Applying local scientific relevance filter..."
-    )
-
-    papers = prepare_papers(
-        records,
-        abstracts
+    ai_results = ai_score_papers(
+        papers_for_ai
     )
 
     print(
-        f"Sending top {len(papers)} papers "
-        f"to DeepSeek..."
+        f"DeepSeek evaluated "
+        f"{len(ai_results)} papers."
     )
 
-
-    ai_results = evaluate_with_ai(
-        papers
-    )
-
+    # --------------------------------------------------------
+    # 7. Combine scores
+    # --------------------------------------------------------
 
     final_papers = combine_scores(
-        papers,
-        ai_results
+        papers_for_ai,
+        ai_results,
     )
 
+    # --------------------------------------------------------
+    # 8. No relevant papers
+    # --------------------------------------------------------
 
-    print_results(
+    if not final_papers:
+
+        print(
+            "No papers met the minimum "
+            "relevance threshold."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # 9. Print results
+    # --------------------------------------------------------
+
+    print("\n")
+    print("=" * 80)
+    print(
+        "FINAL LITERATURE RADAR RESULTS"
+    )
+    print("=" * 80)
+
+    for rank, paper in enumerate(
+        final_papers,
+        1,
+    ):
+
+        print("\n")
+
+        print(
+            f"{rank}. "
+            f"{paper['final_score']:.1f}/10 — "
+            f"{paper['title']}"
+        )
+
+        print(
+            f"   Relevance: "
+            f"{paper['relevance_score']:.1f}"
+        )
+
+        print(
+            f"   Recency: "
+            f"{paper['recency_score']:.1f}"
+        )
+
+        print(
+            f"   Journal: "
+            f"{paper['journal']} "
+            f"({paper['journal_tier']})"
+        )
+
+        print(
+            f"   Year: "
+            f"{paper['year']}"
+        )
+
+        print(
+            f"   Category: "
+            f"{paper['category']}"
+        )
+
+        print(
+            f"   Why relevant: "
+            f"{paper['why_relevant']}"
+        )
+
+        print(
+            f"   TL;DR: "
+            f"{paper['tldr']}"
+        )
+
+        print(
+            f"   PubMed: "
+            f"https://pubmed.ncbi.nlm.nih.gov/"
+            f"{paper['pmid']}/"
+        )
+
+    # --------------------------------------------------------
+    # 10. Send email
+    # --------------------------------------------------------
+
+    print("\n")
+    print(
+        "Preparing email..."
+    )
+
+    send_email(
         final_papers
+    )
+
+    # --------------------------------------------------------
+    # 11. ONLY AFTER successful email:
+    #     save PMIDs as sent
+    # --------------------------------------------------------
+
+    newly_sent_pmids = {
+        paper["pmid"]
+        for paper in final_papers
+    }
+
+    seen_pmids.update(
+        newly_sent_pmids
+    )
+
+    save_seen_pmids(
+        seen_pmids
+    )
+
+    print(
+        f"Recorded "
+        f"{len(newly_sent_pmids)} "
+        f"newly sent PMIDs."
+    )
+
+    print("\n")
+    print(
+        "Literature radar completed successfully."
     )
 
 
