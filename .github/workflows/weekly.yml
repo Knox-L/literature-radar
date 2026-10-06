@@ -22,7 +22,14 @@ jobs:
 
       - name: Run literature radar
         env:
+          # DeepSeek API
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+
+          # 163 Email
+          SENDER: ${{ secrets.SENDER }}
+          RECEIVER: ${{ secrets.RECEIVER }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+
         run: |
           python radar.py
