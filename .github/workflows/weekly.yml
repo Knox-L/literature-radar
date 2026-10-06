@@ -3,6 +3,9 @@ name: Weekly Literature Radar
 on:
   workflow_dispatch:
 
+  schedule:
+    - cron: "0 8 * * 1"
+
 jobs:
   search-literature:
     runs-on: ubuntu-latest
