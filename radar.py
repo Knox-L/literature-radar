@@ -1,3 +1,4 @@
+import time
 import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -8,21 +9,77 @@ from datetime import datetime, timedelta, timezone
 # =========================
 
 SEARCH_DAYS = 7
-MAX_RESULTS = 30
+MAX_RESULTS = 100
 
-SEARCH_TERMS = [
-    '"transitive inference"[Title/Abstract]',
-    '"relational inference"[Title/Abstract]',
-    '("hippocampus"[Title/Abstract] AND "prefrontal cortex"[Title/Abstract])',
-    '("ventral hippocampus"[Title/Abstract] AND "prefrontal"[Title/Abstract])',
-    '("hippocampus"[Title/Abstract] AND "anterior cingulate"[Title/Abstract])',
-    '("relational memory"[Title/Abstract] AND "hippocampus"[Title/Abstract])',
-    '("hierarchical representation"[Title/Abstract] AND "hippocampus"[Title/Abstract])',
-]
+PUBMED_QUERY = """
+(
+    "transitive inference"[Title/Abstract]
+    OR "relational inference"[Title/Abstract]
+    OR ("hippocampus"[Title/Abstract] AND "prefrontal cortex"[Title/Abstract])
+    OR ("ventral hippocampus"[Title/Abstract] AND "prefrontal"[Title/Abstract])
+    OR ("hippocampus"[Title/Abstract] AND "anterior cingulate"[Title/Abstract])
+    OR ("relational memory"[Title/Abstract] AND "hippocampus"[Title/Abstract])
+    OR ("hierarchical representation"[Title/Abstract] AND "hippocampus"[Title/Abstract])
+)
+"""
+
+HEADERS = {
+    "User-Agent": "literature-radar/1.0"
+}
 
 
 # =========================
-# PubMed 搜索
+# PubMed 请求
+# =========================
+
+def pubmed_request(url, params, max_retries=4):
+
+    for attempt in range(max_retries):
+
+        try:
+
+            response = requests.get(
+                url,
+                params=params,
+                headers=HEADERS,
+                timeout=30
+            )
+
+            if response.status_code == 429:
+
+                wait_time = 5 * (attempt + 1)
+
+                print(
+                    f"PubMed rate limit reached. "
+                    f"Waiting {wait_time} seconds..."
+                )
+
+                time.sleep(wait_time)
+                continue
+
+            response.raise_for_status()
+
+            return response
+
+        except requests.RequestException as e:
+
+            if attempt == max_retries - 1:
+                raise
+
+            wait_time = 5 * (attempt + 1)
+
+            print(
+                f"PubMed request failed: {e}. "
+                f"Retrying in {wait_time} seconds..."
+            )
+
+            time.sleep(wait_time)
+
+    raise RuntimeError("PubMed request failed after retries.")
+
+
+# =========================
+# 搜索 PubMed
 # =========================
 
 def search_pubmed(query, start_date, end_date):
@@ -37,10 +94,10 @@ def search_pubmed(query, start_date, end_date):
         "datetype": "pdat",
         "retmax": MAX_RESULTS,
         "retmode": "xml",
+        "sort": "pub date",
     }
 
-    response = requests.get(url, params=params, timeout=30)
-    response.raise_for_status()
+    response = pubmed_request(url, params)
 
     root = ET.fromstring(response.text)
 
@@ -68,8 +125,7 @@ def fetch_pubmed_articles(pmids):
         "retmode": "xml",
     }
 
-    response = requests.get(url, params=params, timeout=30)
-    response.raise_for_status()
+    response = pubmed_request(url, params)
 
     root = ET.fromstring(response.text)
 
@@ -77,20 +133,49 @@ def fetch_pubmed_articles(pmids):
 
     for article in root.findall(".//PubmedArticle"):
 
-        title = article.findtext(".//ArticleTitle", default="")
+        title_node = article.find(".//ArticleTitle")
+
+        title = ""
+
+        if title_node is not None:
+            title = "".join(
+                title_node.itertext()
+            ).strip()
+
+        # -------------------------
+        # Abstract
+        # -------------------------
 
         abstract_parts = []
 
         for node in article.findall(".//Abstract/AbstractText"):
-            if node.text:
-                abstract_parts.append(node.text)
+
+            text = "".join(node.itertext()).strip()
+
+            if text:
+                label = node.attrib.get("Label")
+
+                if label:
+                    abstract_parts.append(
+                        f"{label}: {text}"
+                    )
+                else:
+                    abstract_parts.append(text)
 
         abstract = " ".join(abstract_parts)
+
+        # -------------------------
+        # Journal
+        # -------------------------
 
         journal = article.findtext(
             ".//Journal/Title",
             default=""
         )
+
+        # -------------------------
+        # Publication year
+        # -------------------------
 
         year = (
             article.findtext(".//PubDate/Year")
@@ -98,13 +183,55 @@ def fetch_pubmed_articles(pmids):
             or ""
         )
 
-        pmid = article.findtext(".//PMID", default="")
+        # -------------------------
+        # PMID
+        # -------------------------
+
+        pmid = article.findtext(
+            ".//PMID",
+            default=""
+        )
+
+        # -------------------------
+        # DOI
+        # -------------------------
 
         doi = ""
 
         for article_id in article.findall(".//ArticleId"):
+
             if article_id.attrib.get("IdType") == "doi":
+
                 doi = article_id.text or ""
+
+                break
+
+        # -------------------------
+        # Authors
+        # -------------------------
+
+        authors = []
+
+        for author in article.findall(".//Author"):
+
+            last_name = author.findtext(
+                "LastName",
+                default=""
+            )
+
+            initials = author.findtext(
+                "Initials",
+                default=""
+            )
+
+            if last_name:
+
+                name = last_name
+
+                if initials:
+                    name += f" {initials}"
+
+                authors.append(name)
 
         papers.append({
             "title": title,
@@ -113,6 +240,7 @@ def fetch_pubmed_articles(pmids):
             "year": year,
             "pmid": pmid,
             "doi": doi,
+            "authors": authors,
             "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
         })
 
@@ -126,14 +254,21 @@ def fetch_pubmed_articles(pmids):
 def deduplicate(papers):
 
     seen = set()
+
     unique = []
 
     for paper in papers:
 
-        key = paper["pmid"]
+        key = (
+            paper["pmid"]
+            or paper["doi"]
+            or paper["title"].lower()
+        )
 
         if key not in seen:
+
             seen.add(key)
+
             unique.append(paper)
 
     return unique
@@ -145,59 +280,131 @@ def deduplicate(papers):
 
 def main():
 
-    end_date = datetime.now(timezone.utc).date()
-    start_date = end_date - timedelta(days=SEARCH_DAYS)
+    end_date = datetime.now(
+        timezone.utc
+    ).date()
 
-    start = start_date.strftime("%Y/%m/%d")
-    end = end_date.strftime("%Y/%m/%d")
+    start_date = (
+        end_date -
+        timedelta(days=SEARCH_DAYS)
+    )
+
+    start = start_date.strftime(
+        "%Y/%m/%d"
+    )
+
+    end = end_date.strftime(
+        "%Y/%m/%d"
+    )
 
     print("=" * 70)
     print("Weekly Literature Radar")
     print("=" * 70)
 
-    print(f"Search period: {start} → {end}")
+    print(
+        f"Search period: {start} → {end}"
+    )
+
+    print()
+    print("Searching PubMed...")
     print()
 
-    all_papers = []
+    # -------------------------
+    # Search
+    # -------------------------
 
-    for query in SEARCH_TERMS:
+    pmids = search_pubmed(
+        PUBMED_QUERY,
+        start,
+        end
+    )
 
-        print(f"Searching: {query}")
+    print(
+        f"PubMed found {len(pmids)} papers."
+    )
 
-        pmids = search_pubmed(
-            query,
-            start,
-            end
-        )
+    # -------------------------
+    # Fetch
+    # -------------------------
 
-        print(f"Found {len(pmids)} papers")
+    papers = fetch_pubmed_articles(
+        pmids
+    )
 
-        papers = fetch_pubmed_articles(pmids)
+    # -------------------------
+    # Deduplicate
+    # -------------------------
 
-        all_papers.extend(papers)
-
-    all_papers = deduplicate(all_papers)
+    papers = deduplicate(papers)
 
     print()
     print("=" * 70)
-    print(f"Total unique papers: {len(all_papers)}")
+
+    print(
+        f"Total unique papers: {len(papers)}"
+    )
+
     print("=" * 70)
 
-    for i, paper in enumerate(all_papers, 1):
+    # -------------------------
+    # Display
+    # -------------------------
+
+    for i, paper in enumerate(
+        papers,
+        1
+    ):
 
         print()
-        print(f"[{i}] {paper['title']}")
-        print(f"Journal: {paper['journal']}")
-        print(f"Year: {paper['year']}")
-        print(f"PMID: {paper['pmid']}")
-        print(f"URL: {paper['url']}")
+
+        print(
+            f"[{i}] {paper['title']}"
+        )
+
+        print(
+            f"Journal: {paper['journal']}"
+        )
+
+        print(
+            f"Year: {paper['year']}"
+        )
+
+        print(
+            f"PMID: {paper['pmid']}"
+        )
+
+        if paper["doi"]:
+
+            print(
+                f"DOI: {paper['doi']}"
+            )
+
+        print(
+            f"URL: {paper['url']}"
+        )
+
+        if paper["authors"]:
+
+            print(
+                "Authors:",
+                ", ".join(
+                    paper["authors"][:5]
+                )
+            )
 
         if paper["abstract"]:
+
+            abstract_preview = (
+                paper["abstract"]
+                .replace("\n", " ")
+            )
+
             print(
                 "Abstract:",
-                paper["abstract"][:500].replace("\n", " ")
+                abstract_preview[:600]
             )
 
 
 if __name__ == "__main__":
+
     main()
