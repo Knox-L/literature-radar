@@ -1,132 +1,683 @@
+```python
 import os
+import re
 import time
 import json
 import requests
-import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from openai import OpenAI
 
 
 # ============================================================
-# 基本设置
+# Configuration
 # ============================================================
 
 SEARCH_DAYS = 7
+
+# PubMed最多获取多少篇
 MAX_RESULTS = 100
+
+# 本地预筛选后，最多送给DeepSeek多少篇
+MAX_AI_PAPERS = 40
+
+# 最终输出多少篇
 TOP_N = 15
+
+# ============================================================
+# Final score weights
+# ============================================================
+
+# 科学相关性必须占绝对主导
+RELEVANCE_WEIGHT = 0.70
+
+# 越新越优先
+RECENCY_WEIGHT = 0.15
+
+# 期刊层级
+JOURNAL_WEIGHT = 0.15
+
+
+# ============================================================
+# PubMed query
+# ============================================================
 
 PUBMED_QUERY = """
 (
     "transitive inference"[Title/Abstract]
+    OR "transitive reasoning"[Title/Abstract]
     OR "relational inference"[Title/Abstract]
-    OR ("hippocampus"[Title/Abstract] AND "prefrontal cortex"[Title/Abstract])
-    OR ("ventral hippocampus"[Title/Abstract] AND "prefrontal"[Title/Abstract])
-    OR ("hippocampus"[Title/Abstract] AND "anterior cingulate"[Title/Abstract])
-    OR ("relational memory"[Title/Abstract] AND "hippocampus"[Title/Abstract])
-    OR ("hierarchical representation"[Title/Abstract] AND "hippocampus"[Title/Abstract])
+    OR "relational reasoning"[Title/Abstract]
+    OR "relational memory"[Title/Abstract]
+    OR "hierarchical representation"[Title/Abstract]
+    OR "hierarchical structure"[Title/Abstract]
+    OR "schema-based inference"[Title/Abstract]
+    OR "schema-based reasoning"[Title/Abstract]
+    OR (
+        "hippocampus"[Title/Abstract]
+        AND "prefrontal cortex"[Title/Abstract]
+    )
+    OR (
+        "hippocampus"[Title/Abstract]
+        AND "prefrontal"[Title/Abstract]
+    )
+    OR (
+        "hippocampus"[Title/Abstract]
+        AND "anterior cingulate"[Title/Abstract]
+    )
+    OR (
+        "hippocampus"[Title/Abstract]
+        AND "prelimbic"[Title/Abstract]
+    )
+    OR (
+        "ventral hippocampus"[Title/Abstract]
+        AND "prefrontal"[Title/Abstract]
+    )
+    OR (
+        "CA1"[Title/Abstract]
+        AND "prelimbic"[Title/Abstract]
+    )
 )
 """
 
-HEADERS = {
-    "User-Agent": "literature-radar/1.0"
+
+# ============================================================
+# Journal tiers
+#
+# These are PRIORITY TIERS, not automatically claimed JCR IFs.
+# You can modify this list later.
+# ============================================================
+
+JOURNAL_TIERS = {
+
+    # --------------------------------------------------------
+    # Tier 1: Top neuroscience / cognition journals
+    # --------------------------------------------------------
+
+    "nature": 1,
+    "science": 1,
+    "cell": 1,
+
+    "nature neuroscience": 1,
+    "nature human behaviour": 1,
+    "nature communications": 1,
+    "nature methods": 1,
+
+    "neuron": 1,
+    "current biology": 1,
+    "pnas": 1,
+    "proceedings of the national academy of sciences": 1,
+
+    "science advances": 1,
+    "psychological science": 1,
+
+    # --------------------------------------------------------
+    # Tier 2: Strong field-specific journals
+    # --------------------------------------------------------
+
+    "journal of neuroscience": 2,
+    "cerebral cortex": 2,
+    "hippocampus": 2,
+    "learning & memory": 2,
+    "neurobiology of learning and memory": 2,
+    "behavioral neuroscience": 2,
+    "neuropsychologia": 2,
+    "cognitive neuroscience": 2,
+    "journal of cognitive neuroscience": 2,
+
+    "european journal of neuroscience": 2,
+    "cortex": 2,
+    "cognition": 2,
+
+    "frontiers in behavioral neuroscience": 2,
+    "frontiers in neuroscience": 2,
+
+    "european journal of psychology": 2,
+
+    # --------------------------------------------------------
+    # Tier 3: General / lower priority
+    # --------------------------------------------------------
+
+    "scientific reports": 3,
+    "plos one": 3,
+    "behavioral sciences": 3,
+
 }
 
 
 # ============================================================
-# PubMed 请求
+# Core scientific keywords
 # ============================================================
 
-def pubmed_request(url, params, max_retries=4):
+CORE_KEYWORDS = {
 
-    for attempt in range(max_retries):
+    "transitive inference": 12,
+    "transitive reasoning": 12,
 
-        try:
+    "relational inference": 12,
+    "relational reasoning": 11,
 
-            response = requests.get(
-                url,
-                params=params,
-                headers=HEADERS,
-                timeout=30
-            )
+    "relational memory": 9,
 
-            if response.status_code == 429:
+    "hierarchical representation": 9,
+    "hierarchical representations": 9,
+    "hierarchical structure": 8,
 
-                wait_time = 5 * (attempt + 1)
+    "schema-based inference": 10,
+    "schema-based reasoning": 10,
 
-                print(
-                    f"PubMed rate limit reached. "
-                    f"Waiting {wait_time} seconds..."
-                )
+    "structural knowledge": 7,
 
-                time.sleep(wait_time)
-                continue
+    "inferential": 5,
+    "inference": 3,
+}
 
-            response.raise_for_status()
 
-            return response
+# ============================================================
+# Circuit keywords
+# ============================================================
 
-        except requests.RequestException as e:
+CIRCUIT_KEYWORDS = {
 
-            if attempt == max_retries - 1:
-                raise
+    "ventral hippocampus": 8,
+    "vhippocampus": 8,
+    "vca1": 9,
 
-            wait_time = 5 * (attempt + 1)
+    "ca1": 5,
+    "hippocampus": 4,
 
-            print(
-                f"PubMed request failed: {e}. "
-                f"Retrying in {wait_time} seconds..."
-            )
+    "prelimbic": 8,
+    "prelimbic cortex": 9,
+    "pl cortex": 7,
 
-            time.sleep(wait_time)
+    "prefrontal cortex": 5,
+    "medial prefrontal cortex": 6,
+    "mpfc": 6,
 
-    raise RuntimeError(
-        "PubMed request failed after retries."
+    "anterior cingulate": 7,
+    "cingulate cortex": 5,
+    "cg1": 8,
+
+    "hippocampal-prefrontal": 9,
+    "hippocampal prefrontal": 9,
+
+    "hippocampus-prefrontal": 9,
+    "hippocampus prefrontal": 9,
+
+    "hippocampus-acc": 8,
+    "hippocampal-acc": 8,
+}
+
+
+# ============================================================
+# Methods / mechanisms
+# ============================================================
+
+METHOD_KEYWORDS = {
+
+    "electrophysiology": 5,
+    "single-unit": 4,
+    "single unit": 4,
+
+    "local field potential": 4,
+    "lfp": 4,
+
+    "theta": 3,
+    "gamma": 3,
+
+    "sharp-wave ripple": 4,
+    "sharp wave ripple": 4,
+
+    "population dynamics": 5,
+    "neural dynamics": 4,
+    "neural population": 4,
+
+    "functional connectivity": 3,
+    "coherence": 3,
+    "granger": 3,
+
+    "phase-amplitude coupling": 4,
+    "phase amplitude coupling": 4,
+    "pac": 3,
+
+    "optogenetic": 5,
+    "optogenetics": 5,
+
+    "chemogenetic": 3,
+
+    "projection-specific": 5,
+    "projection specific": 5,
+
+    "circuit manipulation": 5,
+    "causal manipulation": 5,
+
+    "computational model": 4,
+    "computational modeling": 4,
+
+    "reinforcement learning": 4,
+    "value-based": 4,
+    "value learning": 4,
+
+    "schema": 3,
+}
+
+
+# ============================================================
+# Low-priority / clinical topics
+# ============================================================
+
+LOW_PRIORITY_KEYWORDS = {
+
+    "depression": -6,
+    "schizophrenia": -6,
+
+    "cancer": -8,
+
+    "multiple sclerosis": -5,
+
+    "substance use": -5,
+    "cannabis use": -5,
+    "alcohol": -4,
+    "addiction": -5,
+
+    "pain": -4,
+
+    "trauma": -3,
+    "post-traumatic": -3,
+
+    "fear conditioning": -3,
+
+    "stress": -2,
+
+    "anxiety disorder": -5,
+
+    "clinical": -4,
+}
+
+
+# ============================================================
+# Utility
+# ============================================================
+
+def clean_text(text):
+    """Normalize text for keyword matching."""
+
+    if not text:
+        return ""
+
+    text = text.lower()
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+def keyword_score(text, keyword_dict):
+
+    score = 0
+
+    for keyword, weight in keyword_dict.items():
+
+        if keyword.lower() in text:
+            score += weight
+
+    return score
+
+
+# ============================================================
+# Local scientific relevance score
+# ============================================================
+
+def calculate_local_score(title, abstract):
+
+    text = clean_text(
+        f"{title} {abstract}"
     )
 
+    core_score = keyword_score(
+        text,
+        CORE_KEYWORDS
+    )
+
+    circuit_score = keyword_score(
+        text,
+        CIRCUIT_KEYWORDS
+    )
+
+    method_score = keyword_score(
+        text,
+        METHOD_KEYWORDS
+    )
+
+    low_score = keyword_score(
+        text,
+        LOW_PRIORITY_KEYWORDS
+    )
+
+    score = (
+        core_score
+        + circuit_score
+        + method_score
+        + low_score
+    )
+
+    # --------------------------------------------------------
+    # Detect important combinations
+    # --------------------------------------------------------
+
+    has_ti = any(
+        k in text
+        for k in [
+            "transitive inference",
+            "transitive reasoning",
+            "relational inference",
+            "relational reasoning",
+        ]
+    )
+
+    has_hipp = any(
+        k in text
+        for k in [
+            "hippocampus",
+            "ventral hippocampus",
+            "vca1",
+            "ca1",
+        ]
+    )
+
+    has_pfc = any(
+        k in text
+        for k in [
+            "prefrontal",
+            "prelimbic",
+            "mpfc",
+            "anterior cingulate",
+            "cg1",
+        ]
+    )
+
+    has_ephys = any(
+        k in text
+        for k in [
+            "electrophysiology",
+            "lfp",
+            "local field potential",
+            "single-unit",
+            "single unit",
+            "neural population",
+            "population dynamics",
+        ]
+    )
+
+    has_opto = any(
+        k in text
+        for k in [
+            "optogenetic",
+            "optogenetics",
+            "projection-specific",
+            "projection specific",
+            "circuit manipulation",
+        ]
+    )
+
+    # --------------------------------------------------------
+    # Combination bonuses
+    # --------------------------------------------------------
+
+    if has_ti:
+        score += 15
+
+    if has_hipp and has_pfc:
+        score += 8
+
+    if has_hipp and has_pfc and has_ephys:
+        score += 5
+
+    if has_hipp and has_pfc and has_opto:
+        score += 5
+
+    if has_ti and has_hipp:
+        score += 8
+
+    return score
+
 
 # ============================================================
-# 搜索 PubMed
+# Publication year
 # ============================================================
 
-def search_pubmed(query, start_date, end_date):
+def extract_year(pub_date):
 
-    url = (
+    if not pub_date:
+        return None
+
+    match = re.search(
+        r"(19|20)\d{2}",
+        pub_date
+    )
+
+    if match:
+        return int(match.group())
+
+    return None
+
+
+# ============================================================
+# Recency score
+#
+# 10 = current year
+# 9  = previous year
+# 8  = 2 years ago
+# ...
+# Older papers gradually decrease.
+#
+# Important:
+# Old classic papers are NOT deleted.
+# They simply receive less recency weight.
+# ============================================================
+
+def calculate_recency_score(pub_year):
+
+    current_year = datetime.utcnow().year
+
+    if not pub_year:
+        return 5.0
+
+    age = current_year - pub_year
+
+    if age <= 0:
+        return 10.0
+
+    if age == 1:
+        return 9.5
+
+    if age == 2:
+        return 9.0
+
+    if age == 3:
+        return 8.5
+
+    if age == 4:
+        return 8.0
+
+    if age == 5:
+        return 7.5
+
+    if age <= 7:
+        return 6.5
+
+    if age <= 10:
+        return 5.5
+
+    if age <= 15:
+        return 4.0
+
+    if age <= 20:
+        return 2.5
+
+    # More than 20 years old
+    return 1.0
+
+
+# ============================================================
+# Journal tier
+# ============================================================
+
+def normalize_journal_name(journal):
+
+    if not journal:
+        return ""
+
+    journal = journal.lower()
+
+    journal = journal.replace(
+        ".",
+        ""
+    )
+
+    journal = re.sub(
+        r"\s+",
+        " ",
+        journal
+    )
+
+    return journal.strip()
+
+
+def get_journal_tier(journal):
+
+    normalized = normalize_journal_name(
+        journal
+    )
+
+    if normalized in JOURNAL_TIERS:
+        return JOURNAL_TIERS[normalized]
+
+    # Partial matching
+    for name, tier in JOURNAL_TIERS.items():
+
+        if name in normalized:
+            return tier
+
+    # Unknown journal
+    return 4
+
+
+def journal_tier_score(journal):
+
+    tier = get_journal_tier(
+        journal
+    )
+
+    if tier == 1:
+        return 10.0
+
+    if tier == 2:
+        return 8.0
+
+    if tier == 3:
+        return 5.0
+
+    # Unknown / other journals
+    return 4.0
+
+
+# ============================================================
+# PubMed
+# ============================================================
+
+def search_pubmed(
+    query,
+    days=7,
+    max_results=100
+):
+
+    today = datetime.utcnow().date()
+
+    start_date = (
+        today - timedelta(days=days)
+    )
+
+    date_filter = (
+        f'("{start_date.strftime("%Y/%m/%d")}"'
+        f'[Date - Publication] : '
+        f'"{today.strftime("%Y/%m/%d")}"'
+        f'[Date - Publication])'
+    )
+
+    final_query = f"""
+    ({query})
+    AND
+    {date_filter}
+    """
+
+    print("=" * 70)
+    print("Weekly Literature Radar")
+    print("=" * 70)
+
+    print(
+        f"Search period: "
+        f"{start_date.strftime('%Y/%m/%d')} → "
+        f"{today.strftime('%Y/%m/%d')}"
+    )
+
+    print("Searching PubMed...")
+
+    search_url = (
         "https://eutils.ncbi.nlm.nih.gov/"
         "entrez/eutils/esearch.fcgi"
     )
 
     params = {
         "db": "pubmed",
-        "term": query,
-        "mindate": start_date,
-        "maxdate": end_date,
-        "datetype": "pdat",
-        "retmax": MAX_RESULTS,
-        "retmode": "xml",
+        "term": final_query,
+        "retmode": "json",
+        "retmax": max_results,
         "sort": "pub date",
     }
 
-    response = pubmed_request(url, params)
+    headers = {
+        "User-Agent":
+        "Weekly-Literature-Radar/1.0"
+    }
 
-    root = ET.fromstring(response.text)
+    response = requests.get(
+        search_url,
+        params=params,
+        headers=headers,
+        timeout=30,
+    )
 
-    return [
-        item.text
-        for item in root.findall(".//Id")
-        if item.text
-    ]
+    response.raise_for_status()
 
+    data = response.json()
 
-# ============================================================
-# 获取 PubMed 论文详细信息
-# ============================================================
+    pmids = (
+        data
+        .get("esearchresult", {})
+        .get("idlist", [])
+    )
 
-def fetch_pubmed_articles(pmids):
+    print(
+        f"PubMed found {len(pmids)} papers."
+    )
 
     if not pmids:
         return []
 
-    url = (
+    # Avoid rapid consecutive requests
+    time.sleep(0.5)
+
+    return fetch_pubmed_articles(
+        pmids
+    )
+
+
+# ============================================================
+# Fetch PubMed article details
+# ============================================================
+
+def fetch_pubmed_articles(pmids):
+
+    fetch_url = (
         "https://eutils.ncbi.nlm.nih.gov/"
         "entrez/eutils/efetch.fcgi"
     )
@@ -137,26 +688,55 @@ def fetch_pubmed_articles(pmids):
         "retmode": "xml",
     }
 
-    response = pubmed_request(url, params)
+    headers = {
+        "User-Agent":
+        "Weekly-Literature-Radar/1.0"
+    }
 
-    root = ET.fromstring(response.text)
+    response = requests.get(
+        fetch_url,
+        params=params,
+        headers=headers,
+        timeout=60,
+    )
+
+    response.raise_for_status()
+
+    xml = response.text
+
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(xml)
 
     papers = []
 
-    for article in root.findall(".//PubmedArticle"):
+    for article in root.findall(
+        ".//PubmedArticle"
+    ):
+
+        pmid_node = article.find(
+            ".//PMID"
+        )
+
+        if pmid_node is None:
+            continue
+
+        pmid = pmid_node.text.strip()
 
         # ----------------------------------------------------
         # Title
         # ----------------------------------------------------
 
-        title_node = article.find(".//ArticleTitle")
-
-        title = ""
+        title_node = article.find(
+            ".//ArticleTitle"
+        )
 
         if title_node is not None:
             title = "".join(
                 title_node.itertext()
             ).strip()
+        else:
+            title = ""
 
         # ----------------------------------------------------
         # Abstract
@@ -164,28 +744,15 @@ def fetch_pubmed_articles(pmids):
 
         abstract_parts = []
 
-        for node in article.findall(
+        for abstract_text in article.findall(
             ".//Abstract/AbstractText"
         ):
 
-            text = "".join(
-                node.itertext()
-            ).strip()
-
-            if text:
-
-                label = node.attrib.get(
-                    "Label"
-                )
-
-                if label:
-                    abstract_parts.append(
-                        f"{label}: {text}"
-                    )
-                else:
-                    abstract_parts.append(
-                        text
-                    )
+            abstract_parts.append(
+                "".join(
+                    abstract_text.itertext()
+                ).strip()
+            )
 
         abstract = " ".join(
             abstract_parts
@@ -195,142 +762,187 @@ def fetch_pubmed_articles(pmids):
         # Journal
         # ----------------------------------------------------
 
-        journal = article.findtext(
-            ".//Journal/Title",
-            default=""
+        journal_node = article.find(
+            ".//Journal/Title"
         )
 
-        # ----------------------------------------------------
-        # Year
-        # ----------------------------------------------------
-
-        year = (
-            article.findtext(
-                ".//PubDate/Year"
-            )
-            or article.findtext(
-                ".//PubDate/MedlineDate"
-            )
-            or ""
-        )
-
-        # ----------------------------------------------------
-        # PMID
-        # ----------------------------------------------------
-
-        pmid = article.findtext(
-            ".//PMID",
-            default=""
-        )
-
-        # ----------------------------------------------------
-        # DOI
-        # ----------------------------------------------------
-
-        doi = ""
-
-        for article_id in article.findall(
-            ".//ArticleId"
+        if (
+            journal_node is not None
+            and journal_node.text
         ):
+            journal = (
+                journal_node.text.strip()
+            )
+        else:
+            journal = ""
+
+        # ----------------------------------------------------
+        # Publication date
+        # ----------------------------------------------------
+
+        pub_date = ""
+
+        year_node = article.find(
+            ".//PubDate/Year"
+        )
+
+        month_node = article.find(
+            ".//PubDate/Month"
+        )
+
+        day_node = article.find(
+            ".//PubDate/Day"
+        )
+
+        if (
+            year_node is not None
+            and year_node.text
+        ):
+
+            pub_date = year_node.text
 
             if (
-                article_id.attrib.get(
-                    "IdType"
-                )
-                == "doi"
+                month_node is not None
+                and month_node.text
             ):
-
-                doi = (
-                    article_id.text
-                    or ""
+                pub_date += (
+                    f" {month_node.text}"
                 )
 
-                break
+            if (
+                day_node is not None
+                and day_node.text
+            ):
+                pub_date += (
+                    f" {day_node.text}"
+                )
+
+        pub_year = extract_year(
+            pub_date
+        )
 
         # ----------------------------------------------------
-        # Authors
+        # URL
         # ----------------------------------------------------
 
-        authors = []
+        url = (
+            "https://pubmed.ncbi.nlm.nih.gov/"
+            f"{pmid}/"
+        )
 
-        for author in article.findall(
-            ".//Author"
-        ):
-
-            last_name = author.findtext(
-                "LastName",
-                default=""
-            )
-
-            initials = author.findtext(
-                "Initials",
-                default=""
-            )
-
-            if last_name:
-
-                name = last_name
-
-                if initials:
-                    name += (
-                        f" {initials}"
-                    )
-
-                authors.append(name)
-
-        papers.append({
-            "title": title,
-            "abstract": abstract,
-            "journal": journal,
-            "year": year,
-            "pmid": pmid,
-            "doi": doi,
-            "authors": authors,
-            "url": (
-                "https://pubmed.ncbi.nlm.nih.gov/"
-                f"{pmid}/"
-            ),
-        })
+        papers.append(
+            {
+                "pmid": pmid,
+                "title": title,
+                "abstract": abstract,
+                "journal": journal,
+                "pub_date": pub_date,
+                "pub_year": pub_year,
+                "url": url,
+            }
+        )
 
     return papers
 
 
 # ============================================================
-# 去重
+# Local pre-filter
 # ============================================================
 
-def deduplicate(papers):
+def local_prefilter(papers):
 
-    seen = set()
-    unique = []
+    print("=" * 70)
+    print("Local relevance pre-filter")
+    print("=" * 70)
+
+    scored = []
 
     for paper in papers:
 
-        key = (
-            paper["pmid"]
-            or paper["doi"]
-            or paper["title"].lower()
+        local_score = (
+            calculate_local_score(
+                paper["title"],
+                paper["abstract"],
+            )
         )
 
-        if key not in seen:
+        recency_score = (
+            calculate_recency_score(
+                paper["pub_year"]
+            )
+        )
 
-            seen.add(key)
-            unique.append(paper)
+        journal_score = (
+            journal_tier_score(
+                paper["journal"]
+            )
+        )
 
-    return unique
+        # ----------------------------------------------------
+        # Preliminary score
+        #
+        # Scientific relevance remains dominant.
+        # ----------------------------------------------------
+
+        preliminary_score = (
+            local_score * 0.70
+            + recency_score * 0.15
+            + journal_score * 0.15
+        )
+
+        paper["local_score"] = local_score
+        paper["recency_score"] = recency_score
+        paper["journal_score"] = journal_score
+        paper["journal_tier"] = get_journal_tier(
+            paper["journal"]
+        )
+        paper["preliminary_score"] = (
+            preliminary_score
+        )
+
+        scored.append(paper)
+
+    scored.sort(
+        key=lambda x:
+        x["preliminary_score"],
+        reverse=True,
+    )
+
+    selected = scored[
+        :MAX_AI_PAPERS
+    ]
+
+    print(
+        f"Keeping {len(selected)} / "
+        f"{len(papers)} papers "
+        f"for DeepSeek analysis."
+    )
+
+    if selected:
+
+        print(
+            f"Preliminary score range: "
+            f"{selected[-1]['preliminary_score']:.2f}"
+            f" → "
+            f"{selected[0]['preliminary_score']:.2f}"
+        )
+
+    return selected
 
 
 # ============================================================
-# DeepSeek：论文相关性分析
+# DeepSeek analysis
 # ============================================================
 
-def analyze_with_deepseek(papers):
+def analyze_with_deepseek(
+    papers
+):
 
-    api_key = os.environ.get(
+    api_key = os.getenv(
         "OPENAI_API_KEY"
     )
 
-    base_url = os.environ.get(
+    api_base = os.getenv(
         "OPENAI_API_BASE",
         "https://api.deepseek.com"
     )
@@ -343,29 +955,37 @@ def analyze_with_deepseek(papers):
 
     client = OpenAI(
         api_key=api_key,
-        base_url=base_url
+        base_url=api_base,
     )
 
+    print("=" * 70)
+    print("Sending papers to DeepSeek...")
+    print("=" * 70)
+
     # --------------------------------------------------------
-    # 为了控制 API 成本，最多分析前 50 篇
+    # Build paper input
     # --------------------------------------------------------
 
-    papers_for_ai = papers[:50]
-
-    paper_text = []
+    paper_texts = []
 
     for i, paper in enumerate(
-        papers_for_ai
+        papers
     ):
 
-        abstract = paper["abstract"]
+        abstract = paper[
+            "abstract"
+        ]
 
-        if not abstract:
-            abstract = "No abstract available."
+        # Avoid unnecessarily large prompts
+        if len(abstract) > 4000:
+            abstract = (
+                abstract[:4000]
+                + "..."
+            )
 
-        paper_text.append(
+        paper_texts.append(
             f"""
-PAPER {i}
+PAPER {i + 1}
 
 Title:
 {paper["title"]}
@@ -373,270 +993,466 @@ Title:
 Journal:
 {paper["journal"]}
 
+Publication year:
+{paper["pub_year"]}
+
+Publication date:
+{paper["pub_date"]}
+
 Abstract:
 {abstract}
+
+PubMed:
+{paper["url"]}
 """
         )
 
     combined_text = "\n".join(
-        paper_text
+        paper_texts
     )
 
+    # --------------------------------------------------------
+    # System prompt
+    # --------------------------------------------------------
+
     system_prompt = """
-You are a scientific literature screening assistant.
+You are a scientific literature screening assistant for a neuroscience
+researcher.
 
-The researcher is a neuroscience PhD student studying:
+The researcher's main research interests are:
 
-1. Transitive inference and relational inference
-2. Hippocampal-prefrontal interactions
-3. Hippocampus, especially ventral CA1
-4. Prelimbic cortex and medial prefrontal cortex
-5. Anterior cingulate cortex
-6. Relational memory and hierarchical representations
-7. Electrophysiology and neural population dynamics
-8. Optogenetic circuit manipulation
-9. Computational models of value-based learning and relational representation
+1. Transitive inference
+2. Relational inference and relational reasoning
+3. Relational memory
+4. Hierarchical representations
+5. Structural knowledge and schemas
+6. Hippocampal-prefrontal interactions
+7. Ventral CA1 (vCA1)
+8. Prelimbic cortex (PL) / medial prefrontal cortex (mPFC)
+9. Anterior cingulate cortex (ACC/Cg1)
+10. Hippocampal-prefrontal and hippocampal-ACC circuit mechanisms
+11. Electrophysiology, LFP, theta/gamma, ripples and neural population dynamics
+12. Projection-specific circuit manipulation and optogenetics
+13. Computational models of value-based learning versus relational representation
 
-Your task is to evaluate newly published papers for relevance to this research program.
+============================================================
+IMPORTANT RELEVANCE PRINCIPLE
+============================================================
 
-For every paper:
+Scientific relevance is more important than journal prestige.
 
-- Give a relevance score from 0 to 10.
-- Identify the main category.
-- Explain briefly why it is relevant.
-- Give a concise 1-2 sentence TL;DR.
+A directly relevant transitive inference paper in a moderate journal
+should rank above a prestigious but weakly related hippocampal paper.
+
+Do NOT give a paper a high score simply because it contains:
+"hippocampus", "prefrontal cortex", or "ACC".
+
+============================================================
+SCIENTIFIC RELEVANCE PRIORITY
+============================================================
+
+HIGHEST PRIORITY:
+
+- Direct transitive inference
+- Transitive reasoning
+- Relational inference
+- Relational reasoning
+- Hierarchical representation
+- Structural knowledge
+- Schema-based inference
+- Mechanistic studies of inference
+
+HIGH PRIORITY:
+
+- Hippocampal-prefrontal circuit mechanisms related to memory,
+  inference, schemas, or relational representations
+- vCA1-PL interactions
+- hippocampus-mPFC interactions
+- hippocampus-ACC interactions
+- projection-specific manipulation of these circuits
+- optogenetic causal tests of relevant circuits
+
+MODERATE PRIORITY:
+
+- Hippocampal-prefrontal electrophysiology
+- theta/gamma coordination
+- sharp-wave ripples
+- neural population dynamics
+- computational models related to relational or value-based learning
+
+LOW PRIORITY:
+
+- General hippocampal studies without inference or relational memory
+- General PFC or ACC studies without memory/inference relevance
+- Clinical studies where hippocampus/PFC is incidental
+- Stress, depression, addiction, fear conditioning, etc.,
+  unless they provide an unusually relevant circuit mechanism
+
+============================================================
+SCIENTIFIC RELEVANCE SCORE
+============================================================
+
+9.0-10.0:
+Directly addresses transitive/relational inference or is an exceptionally
+close mechanistic match to the researcher's main circuit question.
+
+7.0-8.9:
+Strongly relevant to hippocampal-prefrontal/ACC mechanisms,
+relational memory, electrophysiology, or circuit manipulation.
+
+5.0-6.9:
+Useful background or methodological relevance, but not directly
+addressing the central research questions.
+
+3.0-4.9:
+Indirectly related.
+
+0-2.9:
+Mostly irrelevant.
 
 Be conservative.
 
-A paper should receive a high score only if it has a meaningful conceptual, neural-circuit, methodological, behavioral, or computational connection to the research topics above.
+============================================================
+RECENCY
+============================================================
+
+Recency should be considered, but it must NOT override scientific relevance.
+
+Very recent papers are preferred for the weekly radar.
+
+However:
+- Do NOT discard classic papers merely because they are old.
+- A foundational paper can still be highly relevant.
+- Papers older than 20 years should generally receive lower recency
+  consideration unless they are clearly foundational.
+
+============================================================
+JOURNAL QUALITY
+============================================================
+
+Journal prestige is a secondary factor.
+
+Prefer stronger field journals when scientific relevance is similar.
+
+Do NOT allow journal prestige to compensate for poor scientific relevance.
+
+For example:
+
+A highly relevant paper in Journal of Neuroscience
+should normally beat a generic hippocampal paper in Nature.
+
+============================================================
+OUTPUT
+============================================================
+
+For every paper provide:
+
+- relevance_score: 0-10
+- category
+- why_relevant: one concise sentence
+- tldr: one or two concise sentences
+
+Do NOT calculate the final weighted score yourself.
+
+The program will combine:
+- scientific relevance
+- recency
+- journal tier
 
 Return ONLY valid JSON.
 
-The JSON must be an array with this structure:
+Required format:
 
-[
-  {
-    "paper_index": 0,
-    "score": 8.5,
-    "category": "Hippocampus-PFC",
-    "why_relevant": "...",
-    "tldr": "..."
-  }
-]
+{
+  "papers": [
+    {
+      "index": 1,
+      "relevance_score": 9.5,
+      "category": "Transitive inference",
+      "why_relevant": "...",
+      "tldr": "..."
+    }
+  ]
+}
 """
 
     user_prompt = f"""
-Please analyze the following papers.
+Please screen the following {len(papers)} papers.
+
+Rank them according to their relevance to the researcher's specific
+scientific interests.
+
+Important:
+
+1. Direct transitive inference should strongly outrank generic
+   hippocampal studies.
+
+2. Relational/hierarchical representation should outrank generic
+   memory studies.
+
+3. Mechanistic hippocampal-prefrontal/ACC circuit studies should
+   outrank unrelated clinical hippocampal studies.
+
+4. Recent papers should generally be preferred when scientific
+   relevance is comparable.
+
+5. Strong journals should generally be preferred when scientific
+   relevance is comparable.
+
+6. Do not give a high scientific relevance score simply because
+   a paper contains hippocampus and prefrontal cortex.
+
+Papers:
 
 {combined_text}
 """
 
-    print()
-    print("=" * 70)
-    print("Sending papers to DeepSeek...")
-    print("=" * 70)
+    # --------------------------------------------------------
+    # API call
+    # --------------------------------------------------------
 
     response = client.chat.completions.create(
         model="deepseek-flash",
+
         messages=[
             {
                 "role": "system",
-                "content": system_prompt
+                "content": system_prompt,
             },
             {
                 "role": "user",
-                "content": user_prompt
-            }
+                "content": user_prompt,
+            },
         ],
+
         response_format={
             "type": "json_object"
         },
-        stream=False
+
+        stream=False,
     )
 
     content = (
-        response.choices[0]
+        response
+        .choices[0]
         .message
         .content
     )
 
-    result = json.loads(content)
+    if not content:
 
-    # DeepSeek 有时可能返回：
-    # {"papers": [...]}
-    if isinstance(result, dict):
+        raise RuntimeError(
+            "DeepSeek returned an empty response."
+        )
 
-        if "papers" in result:
-            result = result["papers"]
+    try:
 
-        elif "results" in result:
-            result = result["results"]
+        result = json.loads(
+            content
+        )
+
+    except json.JSONDecodeError as e:
+
+        print(
+            "Raw DeepSeek response:"
+        )
+
+        print(content)
+
+        raise RuntimeError(
+            f"DeepSeek returned invalid JSON: {e}"
+        )
 
     return result
 
 
 # ============================================================
-# 合并 AI 结果
+# Merge AI results with metadata
 # ============================================================
 
-def merge_ai_results(
+def merge_results(
     papers,
-    ai_results
+    ai_result
 ):
 
-    analyzed = []
+    ai_papers = ai_result.get(
+        "papers",
+        []
+    )
 
-    for result in ai_results:
+    merged = []
 
-        index = result.get(
-            "paper_index"
+    for item in ai_papers:
+
+        index = item.get(
+            "index"
         )
 
-        if index is None:
+        if not isinstance(
+            index,
+            int
+        ):
             continue
 
-        if index >= len(papers):
+        if (
+            index < 1
+            or index > len(papers)
+        ):
             continue
 
-        paper = papers[index]
+        paper = papers[
+            index - 1
+        ].copy()
 
-        paper["score"] = float(
-            result.get(
-                "score",
-                0
+        # ----------------------------------------------------
+        # AI scientific relevance
+        # ----------------------------------------------------
+
+        try:
+
+            relevance = float(
+                item.get(
+                    "relevance_score",
+                    0
+                )
             )
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
+            relevance = 0
+
+        relevance = max(
+            0,
+            min(10, relevance)
         )
 
-        paper["category"] = result.get(
+        # ----------------------------------------------------
+        # Existing metadata
+        # ----------------------------------------------------
+
+        recency = paper.get(
+            "recency_score",
+            5.0
+        )
+
+        journal_score = paper.get(
+            "journal_score",
+            4.0
+        )
+
+        # ----------------------------------------------------
+        # Final weighted score
+        #
+        # All components are 0-10.
+        # ----------------------------------------------------
+
+        final_score = (
+            relevance * RELEVANCE_WEIGHT
+            + recency * RECENCY_WEIGHT
+            + journal_score * JOURNAL_WEIGHT
+        )
+
+        paper[
+            "relevance_score"
+        ] = relevance
+
+        paper[
+            "recency_score"
+        ] = recency
+
+        paper[
+            "journal_score"
+        ] = journal_score
+
+        paper[
+            "final_score"
+        ] = final_score
+
+        paper[
+            "category"
+        ] = item.get(
             "category",
             "Other"
         )
 
-        paper["why_relevant"] = result.get(
+        paper[
+            "why_relevant"
+        ] = item.get(
             "why_relevant",
             ""
         )
 
-        paper["tldr"] = result.get(
+        paper[
+            "tldr"
+        ] = item.get(
             "tldr",
             ""
         )
 
-        analyzed.append(paper)
+        merged.append(
+            paper
+        )
 
-    analyzed.sort(
-        key=lambda x: x["score"],
-        reverse=True
+    # --------------------------------------------------------
+    # Sort by final score
+    # --------------------------------------------------------
+
+    merged.sort(
+        key=lambda x:
+        x["final_score"],
+        reverse=True,
     )
 
-    return analyzed
+    return merged
 
 
 # ============================================================
-# 主程序
+# Output
 # ============================================================
 
-def main():
-
-    end_date = datetime.now(
-        timezone.utc
-    ).date()
-
-    start_date = (
-        end_date
-        - timedelta(
-            days=SEARCH_DAYS
-        )
-    )
-
-    start = start_date.strftime(
-        "%Y/%m/%d"
-    )
-
-    end = end_date.strftime(
-        "%Y/%m/%d"
-    )
+def print_results(
+    results
+):
 
     print("=" * 70)
-    print("Weekly Literature Radar")
-    print("=" * 70)
-
     print(
-        f"Search period: {start} → {end}"
-    )
-
-    # --------------------------------------------------------
-    # PubMed
-    # --------------------------------------------------------
-
-    print()
-    print("Searching PubMed...")
-
-    pmids = search_pubmed(
-        PUBMED_QUERY,
-        start,
-        end
-    )
-
-    print(
-        f"PubMed found {len(pmids)} papers."
-    )
-
-    papers = fetch_pubmed_articles(
-        pmids
-    )
-
-    papers = deduplicate(
-        papers
-    )
-
-    print(
-        f"Total unique papers: "
-        f"{len(papers)}"
-    )
-
-    if not papers:
-
-        print(
-            "No papers found."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # DeepSeek
-    # --------------------------------------------------------
-
-    ai_results = analyze_with_deepseek(
-        papers
-    )
-
-    papers = merge_ai_results(
-        papers,
-        ai_results
-    )
-
-    # --------------------------------------------------------
-    # Top papers
-    # --------------------------------------------------------
-
-    print()
-    print("=" * 70)
-    print(
-        f"TOP {min(TOP_N, len(papers))} PAPERS"
+        f"TOP {min(TOP_N, len(results))} PAPERS"
     )
     print("=" * 70)
 
     for i, paper in enumerate(
-        papers[:TOP_N],
-        1
+        results[:TOP_N],
+        start=1
     ):
 
-        print()
         print(
             f"[{i}] "
-            f"{paper['score']}/10 "
+            f"{paper['final_score']:.1f}/10 "
             f"{paper['title']}"
+        )
+
+        print(
+            f"Relevance: "
+            f"{paper['relevance_score']:.1f}/10"
+        )
+
+        print(
+            f"Recency: "
+            f"{paper['recency_score']:.1f}/10"
+        )
+
+        print(
+            f"Journal: "
+            f"{paper['journal']} "
+            f"(Tier {paper['journal_tier']})"
+        )
+
+        print(
+            f"Publication year: "
+            f"{paper['pub_year']}"
         )
 
         print(
@@ -659,6 +1475,103 @@ def main():
             f"{paper['url']}"
         )
 
+        print()
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+
+    # --------------------------------------------------------
+    # 1. PubMed search
+    # --------------------------------------------------------
+
+    papers = search_pubmed(
+        PUBMED_QUERY,
+        days=SEARCH_DAYS,
+        max_results=MAX_RESULTS,
+    )
+
+    if not papers:
+
+        print(
+            "No papers found."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # 2. Deduplicate
+    # --------------------------------------------------------
+
+    unique = {}
+
+    for paper in papers:
+
+        unique[
+            paper["pmid"]
+        ] = paper
+
+    papers = list(
+        unique.values()
+    )
+
+    print(
+        f"Total unique papers: "
+        f"{len(papers)}"
+    )
+
+    # --------------------------------------------------------
+    # 3. Local pre-filter
+    # --------------------------------------------------------
+
+    selected_papers = (
+        local_prefilter(
+            papers
+        )
+    )
+
+    if not selected_papers:
+
+        print(
+            "No papers passed "
+            "local filtering."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # 4. DeepSeek screening
+    # --------------------------------------------------------
+
+    ai_result = (
+        analyze_with_deepseek(
+            selected_papers
+        )
+    )
+
+    # --------------------------------------------------------
+    # 5. Merge
+    # --------------------------------------------------------
+
+    results = (
+        merge_results(
+            selected_papers,
+            ai_result
+        )
+    )
+
+    # --------------------------------------------------------
+    # 6. Output
+    # --------------------------------------------------------
+
+    print_results(
+        results
+    )
+
 
 if __name__ == "__main__":
     main()
+```
